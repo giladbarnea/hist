@@ -283,6 +283,33 @@ class HistcleanTest(TemporaryHomeTestCase):
         self.assertEqual(snapshot(self.home.directory), before)
 
 
+class RealHistoryShapesTest(TemporaryHomeTestCase):
+    def test_a_far_duplicate_does_not_remove_the_last_command_of_a_burst(self) -> None:
+        self.home.write(
+            ".zsh_history",
+            entry(0, "git log --oneline")
+            + entry(10, "git log --oneline -5")
+            + entry(100_000, "git log --oneline"),
+        )
+
+        _, stdout, _ = self.home.run(histmerge.main, [], approve=approve_all)
+
+        expected = entry(10, "git log --oneline -5") + entry(100_000, "git log --oneline")
+        self.assertEqual(stdout.decode(), expected, "A duplicate months later chained into the burst and removed its last command.")
+
+    def test_entries_sharing_an_import_timestamp_do_not_group_by_similarity(self) -> None:
+        imported = (
+            entry(0, 'fd -e md -x rg -l "hist corpus" src')
+            + entry(0, "bat README.md")
+            + entry(0, 'fd -e md -x rg -l "hist corpus" docs')
+        )
+        self.home.write(".zsh_history", imported)
+
+        _, stdout, _ = self.home.run(histmerge.main, [], approve=approve_all)
+
+        self.assertEqual(stdout.decode(), imported, "zsh stamps imported entries with one load time; their real times are unknown.")
+
+
 class GroupFlagTest(unittest.TestCase):
     def test_similar_entries_group_across_an_unrelated_entry(self) -> None:
         entries = parse_entries(

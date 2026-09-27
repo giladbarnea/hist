@@ -20,7 +20,9 @@ Delete the older consolidated file. Otherwise its removed entries return to the 
 ## Review rules
 
 - Exact duplicate entries across files collapse to one.
-- Duplicate commands, and similar commands run within 5 minutes of each other, form a group. The review keeps the last member of a group. Unrelated entries in between are never members.
+- A duplicate command keeps only its last copy.
+- An entry is removed when a similar command runs after it within 5 minutes. Unrelated entries in between are never touched.
+- Entries that share one timestamp never supersede each other. zsh gives imported entries one load time, so their real times are unknown.
 - An entry marked `# !keep` is never removed.
 
 ## Install

@@ -1,6 +1,6 @@
 # Handoff: hist suite redesign (corpus-first)
 
-> **Status 2026-09-27:** implemented on branch `claude/wizardly-hypatia-edn1cy`. Open decision resolved as the time window (5 minutes, `SIMILAR_COMMAND_WINDOW_SECONDS`). Tests: `tests/test_suite.py`.
+> **Status 2026-09-27:** implemented on branch `claude/wizardly-hypatia-edn1cy`. Open decision resolved as the time window (5 minutes, `SIMILAR_COMMAND_WINDOW_SECONDS`). After a real-data run, the rule became "superseded by a later similar command" and groups are no longer merged (merging chained 1,293 unrelated commands into one group). Tests: `tests/test_suite.py`.
 
 Written 2026-09-27 11:51 by the session that diagnosed the `histmerge --all --dry-run` bug. Task is mid-process: diagnosis and design are delivered and accepted in principle. Implementation has not started. No repo file was changed.
 

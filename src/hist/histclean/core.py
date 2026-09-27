@@ -101,14 +101,15 @@ class IndividualFlag(BaseFlag):
 
 
 class GroupFlag(BaseFlag):
-    """A group of duplicate or similar entries. Removes every member except the last; non-members are never touched."""
+    """A group of duplicate or similar entries. Removes the marked members; non-members are never touched."""
 
-    def __init__(self, member_indices: list[int], **kwargs):
+    def __init__(self, member_indices: list[int], removed_indices: set[int], **kwargs):
         super().__init__(**kwargs)
         self.member_indices = member_indices
+        self.removed_indices = removed_indices
 
     def get_indices_to_remove(self) -> set[int]:
-        return set(self.member_indices[:-1])
+        return self.removed_indices
 
     def get_sort_key(self) -> int:
         return self.member_indices[0]
@@ -121,7 +122,7 @@ class GroupFlag(BaseFlag):
         meta_table.add_row(
             "Action:",
             RichText(
-                "Keep only the last marked entry; unmarked entries stay", style="italic #61AFEF"
+                "Remove the entries marked -; everything else stays", style="italic #61AFEF"
             ),
         )
 
@@ -132,12 +133,11 @@ class GroupFlag(BaseFlag):
         entries_table.add_column(width=2, justify="right")
         entries_table.add_column()
 
-        last_member = self.member_indices[-1]
         for previous_member, member in zip([None, *self.member_indices], self.member_indices):
             if previous_member is not None:
                 self._render_non_members(entries_table, range(previous_member + 1, member))
             command = self.all_entries[member].command
-            if member == last_member:
+            if member not in self.removed_indices:
                 syntax = Syntax(command, "bash", theme="monokai", line_numbers=False)
                 self._format_line(entries_table, member, syntax, marker="+")
                 continue

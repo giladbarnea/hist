@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import difflib
 import re
 from collections import defaultdict
@@ -9,7 +10,7 @@ from ..entries import Entry
 from .core import BaseFlag, GroupFlag, IndividualFlag
 
 IndividualStrategy = Callable[[list[Entry]], Iterator[tuple[int, str]]]
-GroupStrategy = Callable[[list[Entry]], Iterator[list[int]]]
+GroupStrategy = Callable[[list[Entry]], Iterator[tuple[list[int], set[int]]]]
 
 BLACKLIST_PATTERNS = [
     re.compile(r"--version\s*$"),
@@ -52,12 +53,13 @@ def flag_individual_orphaned_backslash(entries: list[Entry]) -> Iterator[tuple[i
             yield index, "Entry ends with orphaned backslash (line continuation not found)"
 
 
-def flag_duplicate_groups(entries: list[Entry]) -> Iterator[list[int]]:
+def flag_duplicate_groups(entries: list[Entry]) -> Iterator[tuple[list[int], set[int]]]:
+    """Every copy of a command except the last."""
     command_to_indices: dict[str, list[int]] = defaultdict(list)
     for index, entry in enumerate(entries):
         if command := entry.command.strip():
             command_to_indices[command].append(index)
-    yield from (indices for indices in command_to_indices.values() if len(indices) > 1)
+    yield from ((indices, set(indices[:-1])) for indices in command_to_indices.values() if len(indices) > 1)
 
 
 def tokenize(command: str) -> set[str]:
@@ -93,17 +95,18 @@ def _ratio_reaches(one: str, two: str, threshold: float) -> bool:
     )
 
 
-def flag_similar_groups(entries: list[Entry]) -> Iterator[list[int]]:
-    """Group similar commands run within the time window of each other, transitively.
+def flag_superseded_groups(entries: list[Entry]) -> Iterator[tuple[list[int], set[int]]]:
+    """Remove an entry when a similar command runs after it, within the time window. Group each one with what supersedes it.
 
-    Unrelated entries in between are never members. The relation depends only on each pair's own
-    timestamps and commands, so removing entries creates no new group: a second run over the result finds none.
-    Expects entries sorted by timestamp.
+    Entries with the same timestamp never supersede each other: zsh stamps imported entries with one load time,
+    so their real times are unknown. Whether an entry is superseded depends only on entries after it that survive,
+    so a second run over the result finds nothing. Expects entries sorted by timestamp.
     """
     commands = [entry.command.strip() for entry in entries]
     tokens = [tokenize(command) for command in commands]
     timestamps = [entry.timestamp or 0 for entry in entries]
     parents = list(range(len(entries)))
+    superseded: set[int] = set()
 
     def find_root(index: int) -> int:
         while parents[index] != index:
@@ -112,20 +115,23 @@ def flag_similar_groups(entries: list[Entry]) -> Iterator[list[int]]:
         return index
 
     for first in range(len(entries)):
-        for second in range(first + 1, len(entries)):
+        if not commands[first]:
+            continue
+        for second in range(bisect.bisect_right(timestamps, timestamps[first]), len(entries)):
             if timestamps[second] - timestamps[first] > SIMILAR_COMMAND_WINDOW_SECONDS:
                 break
-            if not commands[first] or not commands[second]:
-                continue
-            if are_tokens_similar_jaccard(tokens[first], tokens[second]) or are_tokens_similar_difflib(
-                tokens[first], tokens[second]
+            if commands[second] and (
+                are_tokens_similar_jaccard(tokens[first], tokens[second])
+                or are_tokens_similar_difflib(tokens[first], tokens[second])
             ):
-                parents[find_root(second)] = find_root(first)
+                superseded.add(first)
+                parents[find_root(first)] = find_root(second)
+                break
 
     groups: dict[int, list[int]] = defaultdict(list)
     for index in range(len(entries)):
         groups[find_root(index)].append(index)
-    yield from (members for members in groups.values() if len(members) > 1)
+    yield from ((members, superseded.intersection(members)) for members in groups.values() if len(members) > 1)
 
 
 INDIVIDUAL_STRATEGIES: list[IndividualStrategy] = [
@@ -137,40 +143,10 @@ INDIVIDUAL_STRATEGIES: list[IndividualStrategy] = [
 GROUP_STRATEGIES: list[tuple[GroupStrategy, str]] = [
     (flag_duplicate_groups, "Duplicate command"),
     (
-        flag_similar_groups,
-        f"Similar commands within {SIMILAR_COMMAND_WINDOW_SECONDS // 60} minutes of each other",
+        flag_superseded_groups,
+        f"A similar command followed within {SIMILAR_COMMAND_WINDOW_SECONDS // 60} minutes",
     ),
 ]
-
-
-def merge_groups(groups: list[tuple[list[int], str]]) -> list[tuple[list[int], list[str]]]:
-    """Merge groups that share a member into one group.
-
-    >>> merge_groups([([1, 5], "dup"), ([5, 6], "similar"), ([8, 9], "dup")])
-    [([1, 5, 6], ['dup', 'similar']), ([8, 9], ['dup'])]
-    """
-    parents = list(range(len(groups)))
-
-    def find_root(group_index: int) -> int:
-        while parents[group_index] != group_index:
-            group_index = parents[group_index]
-        return group_index
-
-    owner_by_member: dict[int, int] = {}
-    for group_index, (members, _) in enumerate(groups):
-        for member in members:
-            if member in owner_by_member:
-                parents[find_root(group_index)] = find_root(owner_by_member[member])
-                continue
-            owner_by_member[member] = group_index
-
-    merged: dict[int, tuple[set[int], list[str]]] = {}
-    for group_index, (members, reason) in enumerate(groups):
-        merged_members, reasons = merged.setdefault(find_root(group_index), (set(), []))
-        merged_members.update(members)
-        if reason not in reasons:
-            reasons.append(reason)
-    return [(sorted(members), reasons) for members, reasons in merged.values()]
 
 
 def analyze(entries: list[Entry]) -> list[BaseFlag]:
@@ -181,15 +157,11 @@ def analyze(entries: list[Entry]) -> list[BaseFlag]:
     }
     is_kept = [bool(KEEP_MARKER_RE.search(entry.command)) for entry in entries]
 
-    raw_groups = [
-        (removable_members, reason)
-        for strategy, reason in GROUP_STRATEGIES
-        for members in strategy(entries)
-        if len(removable_members := [member for member in members if not is_kept[member]]) > 1
-    ]
     group_flags = [
-        GroupFlag(member_indices=members, reason_text=" / ".join(reasons), **flag_context)
-        for members, reasons in merge_groups(raw_groups)
+        GroupFlag(member_indices=members, removed_indices=removable, reason_text=reason, **flag_context)
+        for strategy, reason in GROUP_STRATEGIES
+        for members, removed in strategy(entries)
+        if (removable := {index for index in removed if not is_kept[index]})
     ]
     removed_by_groups = set().union(*(flag.get_indices_to_remove() for flag in group_flags))
 
