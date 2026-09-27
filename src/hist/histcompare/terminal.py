@@ -31,8 +31,6 @@ def category_color(category: str) -> str:
     """Return the Rich color for a file category."""
     return {
         "main": "bold magenta",
-        "timestamped": "bold yellow",
-        "clean": "cyan",
         "snapshot": "green",
         "other": "white",
     }.get(category, "white")
@@ -151,18 +149,6 @@ def render_summary(result: AnalysisResult) -> Panel:
 
     lines: list[Text] = []
 
-    if result.dirty_file_count:
-        lines.append(
-            Text.assemble(
-                ("Note: ", "bold yellow"),
-                (
-                    "one or more selected history files are not clean; optimal timeline may change after cleaning.",
-                    "yellow",
-                ),
-            )
-        )
-        lines.append(Text(""))
-
     if main_history and earliest_file and main_history.start_ts and earliest_file.start_ts:
         gap_days = (main_history.start_ts - earliest_file.start_ts) // 86400
         if gap_days > 0:
@@ -209,23 +195,6 @@ def render_summary(result: AnalysisResult) -> Panel:
                 ),
             )
         )
-
-    if result.optimal_path:
-        lines.append(Text(""))
-        lines.append(Text("Optimal Coverage Path:", style="bold green"))
-        for segment in result.optimal_path:
-            duration = max(1, (segment.end_ts - segment.start_ts) // 86400)
-            lines.append(
-                Text.assemble(
-                    ("  • ", "dim"),
-                    (segment.file.name, "cyan"),
-                    (f" ({duration}d)", "dim"),
-                    (" : ", "dim"),
-                    (format_date_short(segment.start_ts), "bold"),
-                    (" → ", "dim"),
-                    (format_date_short(segment.end_ts), "bold"),
-                )
-            )
 
     return Panel(
         "\n".join(str(line) for line in lines),

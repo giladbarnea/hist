@@ -1,13 +1,10 @@
-from .api import check, clean, inspect_history_file, inspect_history_files, main
-from .core import HistoryCheckResult
+from .api import Approve, approve_in_tui, main, review
 from .ui import console
 
 __all__ = [
-    "HistoryCheckResult",
-    "check",
-    "clean",
+    "Approve",
+    "approve_in_tui",
     "console",
-    "inspect_history_file",
-    "inspect_history_files",
     "main",
+    "review",
 ]

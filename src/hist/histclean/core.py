@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from pathlib import Path
 
 from rich import box
 from rich.console import Group
@@ -14,54 +11,21 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text as RichText
 
-HISTORY_ENTRY_RE = re.compile(r"^: \d{10}:\d+;")
+from ..entries import Entry
 
-
-def parse_history_entries(all_lines: list[str]):
-    """Parse zsh history into individual entry blocks."""
-    if not all_lines:
-        return
-
-    index = 0
-    line_count = len(all_lines)
-    while index < line_count:
-        current_line = all_lines[index]
-        if HISTORY_ENTRY_RE.match(current_line):
-            next_index = index + 1
-            while next_index < line_count and not HISTORY_ENTRY_RE.match(
-                all_lines[next_index]
-            ):
-                next_index += 1
-            yield index, all_lines[index:next_index]
-            index = next_index
-            continue
-        yield index, [current_line]
-        index += 1
-
-
-def remove_timestamp_from_entry(entry_block: list[str]) -> str:
-    """Extract the command text from a history entry block."""
-    if not entry_block:
-        return ""
-    first_line = entry_block[0]
-    if HISTORY_ENTRY_RE.match(first_line):
-        command_part = first_line.split(";", 1)[1]
-        return "\n".join([command_part, *entry_block[1:]])
-    return "\n".join(entry_block)
+MAX_SHOWN_NON_MEMBERS = 3
 
 
 class BaseFlag(ABC):
-    """Abstract base class for a flagged change in the history file."""
+    """Abstract base class for a flagged change in the history."""
 
     def __init__(
         self,
-        all_entries: list[list[str]],
-        entry_line_nums: list[int],
+        all_entries: list[Entry],
         max_line_num_width: int,
         reason_text: str,
     ):
         self.all_entries = all_entries
-        self.entry_line_nums = entry_line_nums
         self.max_line_num_width = max_line_num_width
         self.reason_text = reason_text
 
@@ -69,15 +33,12 @@ class BaseFlag(ABC):
     def get_indices_to_remove(self) -> set[int]:
         raise NotImplementedError
 
+    @abstractmethod
     def render(self) -> Panel:
         raise NotImplementedError
 
     @abstractmethod
     def get_sort_key(self) -> int:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_all_covered_indices(self) -> set[int]:
         raise NotImplementedError
 
     def _format_line(
@@ -87,12 +48,10 @@ class BaseFlag(ABC):
         content_renderable: RichText | Syntax,
         marker: str = " ",
     ) -> None:
-        line_num = self.entry_line_nums[entry_index] + 1
-        line_num_str = f"{line_num}"
         marker_text = RichText(
             marker, style=f"diff.{'plus' if marker == '+' else 'minus'}"
         )
-        table.add_row(line_num_str, marker_text, content_renderable)
+        table.add_row(f"{entry_index + 1}", marker_text, content_renderable)
 
 
 class IndividualFlag(BaseFlag):
@@ -113,18 +72,14 @@ class IndividualFlag(BaseFlag):
     def get_sort_key(self) -> int:
         return self.entry_index
 
-    def get_all_covered_indices(self) -> set[int]:
-        return {self.entry_index}
-
     def render(self) -> Panel:
         meta_table = Table.grid(padding=(0, 2))
         meta_table.add_column(style=Style.parse("bold #98C379"))
         meta_table.add_column()
         meta_table.add_row("Reason(s):", self.reason_text)
-        entry_command = remove_timestamp_from_entry(self.all_entries[self.entry_index])
+        entry_command = self.all_entries[self.entry_index].command
 
-        line_num = self.entry_line_nums[self.entry_index] + 1
-        line_num_str = f"{line_num:>{self.max_line_num_width}}"
+        line_num_str = f"{self.entry_index + 1:>{self.max_line_num_width}}"
         line_num_text = RichText(line_num_str, style="#3A3F4C")
 
         entry_syntax = Syntax(entry_command, "bash", theme="monokai", line_numbers=False)
@@ -145,22 +100,18 @@ class IndividualFlag(BaseFlag):
         )
 
 
-class ClusterFlag(BaseFlag):
-    """Represents a sequence of similar commands to be collapsed."""
+class GroupFlag(BaseFlag):
+    """A group of duplicate or similar entries. Removes every member except the last; non-members are never touched."""
 
-    def __init__(self, start_index: int, end_index: int, **kwargs):
+    def __init__(self, member_indices: list[int], **kwargs):
         super().__init__(**kwargs)
-        self.start_index = start_index
-        self.end_index = end_index
+        self.member_indices = member_indices
 
     def get_indices_to_remove(self) -> set[int]:
-        return set(range(self.start_index, self.end_index))
+        return set(self.member_indices[:-1])
 
     def get_sort_key(self) -> int:
-        return self.start_index
-
-    def get_all_covered_indices(self) -> set[int]:
-        return set(range(self.start_index, self.end_index + 1))
+        return self.member_indices[0]
 
     def render(self) -> Panel:
         meta_table = Table.grid(padding=(0, 1, 1, 2))
@@ -170,7 +121,7 @@ class ClusterFlag(BaseFlag):
         meta_table.add_row(
             "Action:",
             RichText(
-                "Keep only the last entry in the sequence", style="italic #61AFEF"
+                "Keep only the last marked entry; unmarked entries stay", style="italic #61AFEF"
             ),
         )
 
@@ -181,107 +132,30 @@ class ClusterFlag(BaseFlag):
         entries_table.add_column(width=2, justify="right")
         entries_table.add_column()
 
-        if self.start_index > 0:
-            before_index = self.start_index - 1
-            command = remove_timestamp_from_entry(self.all_entries[before_index])
-            self._format_line(entries_table, before_index, RichText(command, style="#5C6370"))
-
-        for offset, entry_index in enumerate(range(self.start_index, self.end_index + 1)):
-            is_last = offset == self.end_index - self.start_index
-            command = remove_timestamp_from_entry(self.all_entries[entry_index])
-            if is_last:
+        last_member = self.member_indices[-1]
+        for previous_member, member in zip([None, *self.member_indices], self.member_indices):
+            if previous_member is not None:
+                self._render_non_members(entries_table, range(previous_member + 1, member))
+            command = self.all_entries[member].command
+            if member == last_member:
                 syntax = Syntax(command, "bash", theme="monokai", line_numbers=False)
-                self._format_line(entries_table, entry_index, syntax, marker="+")
+                self._format_line(entries_table, member, syntax, marker="+")
                 continue
-            dimmed_syntax = RichText(command, style="#5C6370")
-            self._format_line(entries_table, entry_index, dimmed_syntax, marker="-")
-
-        if self.end_index < len(self.all_entries) - 1:
-            after_index = self.end_index + 1
-            command = remove_timestamp_from_entry(self.all_entries[after_index])
-            self._format_line(entries_table, after_index, RichText(command, style="#5C6370"))
+            self._format_line(entries_table, member, RichText(command, style="#5C6370"), marker="-")
 
         content_group = Group(meta_table, Rule(style="#4B5263"), entries_table)
 
         return Panel(
             content_group,
             box=box.ROUNDED,
-            title="[title]Similar Command Sequence[/title]",
+            title="[title]Entry Group[/title]",
             border_style="#4B5263",
             padding=(0, 1),
         )
 
-
-class DuplicateFlag(BaseFlag):
-    """Represents a group of duplicate commands to be collapsed."""
-
-    def __init__(self, entry_indices: list[int], **kwargs):
-        super().__init__(**kwargs)
-        self.entry_indices = entry_indices
-
-    def get_indices_to_remove(self) -> set[int]:
-        return set(self.entry_indices[:-1])
-
-    def get_sort_key(self) -> int:
-        return self.entry_indices[0]
-
-    def get_all_covered_indices(self) -> set[int]:
-        return set(self.entry_indices)
-
-    def render(self) -> Panel:
-        meta_table = Table.grid(padding=(0, 1, 1, 2))
-        meta_table.add_column(style=Style.parse("bold #98C379"))
-        meta_table.add_column()
-        meta_table.add_row("Reason:", self.reason_text)
-        meta_table.add_row(
-            "Action:",
-            RichText(
-                "Keep only the last entry in the sequence", style="italic #61AFEF"
-            ),
-        )
-
-        entries_table = Table.grid(padding=(0, 1))
-        entries_table.add_column(
-            width=self.max_line_num_width + 1, justify="right", style="#3A3F4C"
-        )
-        entries_table.add_column(width=2, justify="right")
-        entries_table.add_column()
-
-        for offset, entry_index in enumerate(self.entry_indices):
-            is_last = offset == len(self.entry_indices) - 1
-            command = remove_timestamp_from_entry(self.all_entries[entry_index])
-            if is_last:
-                syntax = Syntax(command, "bash", theme="monokai", line_numbers=False)
-                self._format_line(entries_table, entry_index, syntax, marker="+")
-                continue
-            dimmed_syntax = RichText(command, style="#5C6370")
-            self._format_line(entries_table, entry_index, dimmed_syntax, marker="-")
-
-        content_group = Group(meta_table, Rule(style="#4B5263"), entries_table)
-
-        return Panel(
-            content_group,
-            box=box.ROUNDED,
-            title="[title]Duplicate Commands[/title]",
-            border_style="#4B5263",
-            padding=(0, 1),
-        )
-
-
-@dataclass
-class HistoryAnalysis:
-    original_lines: list[str]
-    all_entries: list[list[str]]
-    flagged_entries: list[BaseFlag]
-
-    @property
-    def is_clean(self) -> bool:
-        return not self.flagged_entries
-
-
-@dataclass
-class HistoryCheckResult:
-    path: Path
-    is_clean: bool
-    flagged_count: int = 0
-    error: str | None = None
+    def _render_non_members(self, table: Table, non_members: range) -> None:
+        if len(non_members) > MAX_SHOWN_NON_MEMBERS:
+            table.add_row("", "", RichText(f"⋯ {len(non_members)} other entries", style="#3A3F4C"))
+            return
+        for index in non_members:
+            self._format_line(table, index, RichText(self.all_entries[index].command, style="#3A3F4C"))

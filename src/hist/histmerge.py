@@ -1,261 +1,79 @@
 """
-Merge-sort zsh history snapshots and emit the union.
+Merge the zsh history corpus, review it once, and print the clean union to stdout.
 
-Discovery
-- Uses histclean's shared discovery, which includes by default:
-  - numeric ".zsh_history.*" snapshots in CWD and HOME
-  - numeric files in "~/.zsh_history_backups/"
-  - the live ".zsh_history" if present
-- With "--all", discovery also includes:
-  - ".zsh_hist.clean.*" outputs
-  - non-numeric ".zsh_history.*" files such as merged/prevsnapshot variants
-  - "*.zsh_history" files such as PID-suffixed snapshots
-- Explicit CLI paths override discovery.
+Inputs
+- Explicit paths, else the corpus: ~/.zsh_history plus ~/.zsh_history.*, minus
+  zsh's transient .new and .LOCK files.
+- Inputs are read-only. histmerge writes nothing except stdout and stderr.
 
-Safety
-- Checks whether the selected history files are already clean before merging.
-- If any selected file is dirty, prompts whether to continue anyway, run
-  histclean first, or quit.
-- If the selected files are clean, prints a success message and proceeds.
+Pipeline
+1. Parse every file into entries. A multi-line entry stays one entry.
+2. Union: exact duplicate entries collapse to one; sort by timestamp.
+3. With a TTY on stdin, analyze the union once and review the flags in a TUI
+   drawn on stderr, so `histmerge | grep foo` works. Without a TTY, skip the
+   review and print the raw union.
+4. Print the kept entries to stdout.
 
-Behavior
-- Reads files in chronological order from the shared discovery/sort logic.
-- Deduplicates by exact line text across all files (newline stripped).
-- Parses EXTENDED_HISTORY lines and sorts the union by timestamp (stable by
-  arrival order for equal timestamps).
-- Writes the merged union lines to stdout only.
-- With "--dry-run", skips writing the merged union to stdout and only reports
-  what would be merged via stderr stats.
-- With "--cleanup", removes the initially selected source files after the merged
-  union reaches stdout, while preserving every live ".zsh_history" file.
-- Prints progress and per-file stats to stderr (raw, unique_in_file,
-  newly_contributed, cumulative_union), plus a final union summary. This lets
-  you redirect stdout/stderr independently.
-
-Assumptions
-- Each line is a single entry and follows EXTENDED_HISTORY format:
-  ": <epoch>:<duration>;command". If the histories are dirty, the script warns
-  before merging because multiline entries would otherwise be truncated.
+To persist the result, redirect it to a new dated file such as
+~/.zsh_history.2026-09-27.consolidated, then delete the older consolidated
+file. Otherwise its removed entries return to the union on the next run.
 """
 
 from __future__ import annotations
 
 import argparse
-import re
 import sys
-from collections.abc import Iterable
 from pathlib import Path
 
-from .histclean import HistoryCheckResult, console, inspect_history_files
-from .histclean import clean as clean_histories
-from .history_files import discover_history_files
-
-EXT_LINE_RE = re.compile(r"^:\s*(\d+)\:(\d+)\;.*")
+from .corpus import history_paths
+from .entries import Entry, read_entries, render, union
+from .histclean import Approve, approve_in_tui, console, review
 
 
-def iter_nonempty_lines(path: Path) -> Iterable[str]:
-    with path.open("r", encoding="utf-8", errors="replace") as file_handle:
-        for line in file_handle:
-            line = line.rstrip("\n")
-            if line:
-                yield line
+def print_stats(paths: list[Path], entry_lists: list[list[Entry]], merged: list[Entry]) -> None:
+    seen: set[Entry] = set()
+    for path, entries in zip(paths, entry_lists, strict=True):
+        newly_contributed = len(set(entries) - seen)
+        seen.update(entries)
+        print(f"{path}: entries={len(entries)}, newly_contributed={newly_contributed}", file=sys.stderr)
+    total = sum(len(entries) for entries in entry_lists)
+    print(f"union: files={len(paths)}, entries={len(merged)}, duplicates_collapsed={total - len(merged)}", file=sys.stderr)
 
 
-def _print_dirty_results(results: list[HistoryCheckResult]) -> None:
-    console.print("[warning]Selected history files are not clean.[/warning]")
-    for result in results:
-        if result.error:
-            console.print(f"[error]- {result.path}: {result.error}[/error]")
-            continue
-        console.print(
-            f"[warning]- {result.path}: {result.flagged_count} pending change(s)[/warning]"
-        )
-
-
-def _prompt_dirty_action() -> str:
-    prompt = "Continue anyway, run histclean first, or quit? [c/r/q]: "
-    while True:
-        print(prompt, file=sys.stderr, end="", flush=True)
-        choice = sys.stdin.readline()
-        if not choice:
-            return "q"
-        normalized = choice.strip().lower()
-        if normalized in {"c", "r", "q"}:
-            return normalized
-        print("Please type c, r, or q.", file=sys.stderr)
-
-
-def remove_merged_source_files(paths: Iterable[Path]) -> None:
-    """Remove merged backup sources while preserving live history files."""
-    removable_paths = [
-        path for path in paths if path.exists() and path.name != ".zsh_history"
-    ]
-    backup_directories = {
-        path.parent
-        for path in removable_paths
-        if path.parent.name == ".zsh_history_backups"
-    }
-
-    print("Cleanup:", file=sys.stderr)
-    for path in removable_paths:
-        path.unlink()
-        print(f"- removed {path}", file=sys.stderr)
-
-    for directory in sorted(backup_directories):
-        if any(directory.iterdir()):
-            continue
-        directory.rmdir()
-        print(f"- removed empty directory {directory}", file=sys.stderr)
-
-    print(f"files_removed={len(removable_paths)}", file=sys.stderr)
-
-
-def ensure_histories_are_clean(paths: list[Path]) -> bool:
-    existing_paths = [path for path in paths if path.exists()]
-    if not existing_paths:
-        console.print("[error]No existing history files were selected.[/error]")
-        return False
-
-    while True:
-        dirty_results = [
-            result
-            for result in inspect_history_files(existing_paths)
-            if not result.is_clean
-        ]
-        if not dirty_results:
-            console.print(
-                "[success]Selected history files are clean and can proceed merging.[/success]"
-            )
-            return True
-
-        _print_dirty_results(dirty_results)
-        if not sys.stdin.isatty():
-            console.print(
-                "[error]Cannot prompt because stdin is not a TTY. Run histclean first or re-run interactively.[/error]"
-            )
-            return False
-
-        choice = _prompt_dirty_action()
-        if choice == "c":
-            return True
-        if choice == "q":
-            return False
-        clean_histories([result.path for result in dirty_results])
-
-
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, approve: Approve | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Merge-sort zsh history snapshots; emit union to stdout; stats to stderr"
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    parser.add_argument("files", nargs="*", help="Files to merge instead of the corpus")
     parser.add_argument(
-        "files", nargs="*", help="Files to include (overrides default discovery)"
-    )
-    parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Expand automatic discovery to include clean outputs and other history-like files.",
-    )
-    output_actions = parser.add_mutually_exclusive_group()
-    output_actions.add_argument(
         "--dry-run",
         action="store_true",
-        help="Inspect and summarize the merge without writing the merged union to stdout.",
-    )
-    output_actions.add_argument(
-        "--cleanup",
-        action="store_true",
-        help="Remove selected backup sources after successfully writing the merged union.",
+        help="Print per-file and union counts to stderr, then stop.",
     )
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
-    paths = discover_history_files(args.files, include_all=args.all)
+    paths = history_paths(args.files)
     if not paths:
         console.print("[error]No history files found.[/error]")
         return 1
-    if not ensure_histories_are_clean(paths):
-        return 1
-
-    union_seen: set[str] = set()
-    union_records: list[tuple[int, int, str]] = []
-    seq = 0
-    total_raw = 0
-
-    print("Processing order (chronological):", file=sys.stderr)
-    for path in paths:
-        print(f"- {path.name}", file=sys.stderr)
-    print(file=sys.stderr)
-
-    print("Per-file stats:", file=sys.stderr)
-    for path in paths:
-        if not path.exists():
-            print(f"{path.name}: MISSING (skipped)", file=sys.stderr)
-            continue
-
-        raw_lines = list(iter_nonempty_lines(path))
-        raw_count = len(raw_lines)
-        total_raw += raw_count
-        unique_in_file = len(set(raw_lines))
-
-        new_count = 0
-        for line in raw_lines:
-            if line in union_seen:
-                continue
-            match = EXT_LINE_RE.match(line)
-            if not match:
-                print(
-                    f"{path.name}: skipped non-extended-history line: {line}",
-                    file=sys.stderr,
-                )
-                continue
-            try:
-                timestamp = int(match.group(1))
-            except ValueError:
-                print(f"{path.name}: bad timestamp in line: {line}", file=sys.stderr)
-                continue
-
-            union_seen.add(line)
-            union_records.append((timestamp, seq, line))
-            seq += 1
-            new_count += 1
-
-        print(
-            f"{path.name}: raw={raw_count}, unique_in_file={unique_in_file}, "
-            f"newly_contributed={new_count}, cumulative_union={len(union_seen)}",
-            file=sys.stderr,
-        )
-
-    print(file=sys.stderr)
-    print("Union summary:", file=sys.stderr)
-    files_processed = sum(1 for path in paths if path.exists())
-    total_unique = len(union_seen)
-    print(f"files_processed={files_processed}", file=sys.stderr)
-    print(f"total_raw_lines={total_raw}", file=sys.stderr)
-    print(f"total_unique_lines={total_unique}", file=sys.stderr)
-    if total_raw:
-        removed = total_raw - total_unique
-        pct = (total_unique / total_raw) * 100.0
-        print(f"duplicates_removed={removed}", file=sys.stderr)
-        print(f"unique_ratio={pct:.2f}%", file=sys.stderr)
-
+    entry_lists = [read_entries(path) for path in paths]
+    merged = union(entry_lists)
+    print_stats(paths, entry_lists, merged)
     if args.dry_run:
-        print("dry_run=true", file=sys.stderr)
-        print("merged output suppressed", file=sys.stderr)
         return 0
 
-    union_records.sort(key=lambda record: (record[0], record[1]))
+    if approve is None and sys.stdin.isatty():
+        approve = approve_in_tui
+    if approve is None:
+        console.print("[warning]stdin is not a TTY. Skipping the review and printing the raw union.[/warning]")
+    kept_entries = review(merged, approve) if approve else merged
+
+    sys.stdout.reconfigure(errors="surrogateescape")
     try:
-        for _, __, line in union_records:
-            sys.stdout.write(line + "\n")
+        sys.stdout.write(render(kept_entries))
         sys.stdout.flush()
     except BrokenPipeError:
-        try:
-            sys.stdout.flush()
-        except Exception:
-            pass
-        return 0
-
-    if args.cleanup:
-        remove_merged_source_files(paths)
+        pass
     return 0
 
 

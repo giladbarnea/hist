@@ -37,12 +37,6 @@ def generate_html(result: AnalysisResult) -> str:
         default=None,
     )
 
-    cleanliness_note_html = ""
-    if result.dirty_file_count:
-        cleanliness_note_html = """
-              <p><strong>Note:</strong> one or more selected history files are not clean; optimal timeline may change after cleaning.</p>
-          """
-
     gap_html = ""
     if main_history and earliest_file and main_history.start_ts and earliest_file.start_ts:
         gap_days = (main_history.start_ts - earliest_file.start_ts) // 86400
@@ -50,59 +44,6 @@ def generate_html(result: AnalysisResult) -> str:
             gap_html = f"""
               <p><strong>Main .zsh_history is missing {gap_days} days of history</strong> ({format_date_short(earliest_file.start_ts)} - {format_date_short(main_history.start_ts)})</p>
               """
-
-    backups = [
-        history_file
-        for history_file in result.files
-        if history_file.category != "main" and history_file.lines > 0
-    ]
-    largest_backup = max(backups, key=lambda history_file: history_file.lines) if backups else None
-
-    recovery_html = ""
-    if result.optimal_path:
-        recovery_html += "<p><strong>Recommended Recovery Plan (Optimal Path):</strong></p>"
-        recovery_html += "<ul style='margin-left: 20px; margin-top: 10px; font-family: monospace; font-size: 13px; color: #ccc;'>"
-        for segment in result.optimal_path:
-            duration = max(1, (segment.end_ts - segment.start_ts) // 86400)
-            recovery_html += (
-                f"<li>"
-                f"<span style='color: #888'>{format_date_short(segment.start_ts)} - {format_date_short(segment.end_ts)}</span>"
-                f" <span style='color: #555'>({duration}d)</span>: "
-                f"<span class='recovery-source' data-path='{segment.file.path.resolve()}' style='color: #4facfe; cursor: pointer; transition: all 0.2s; border-bottom: 1px dashed transparent;'>{segment.file.name}</span>"
-                f"</li>"
-            )
-        recovery_html += "</ul>"
-        recovery_html += """
-          <style>
-              .recovery-source:hover {
-                  color: #fff !important;
-                  border-bottom: 1px dashed #fff !important;
-                  text-shadow: 0 0 8px rgba(79, 172, 254, 0.6);
-              }
-          </style>
-          """
-    elif largest_backup:
-        recovery_html = f"""
-              <p><strong>Best single recovery source:</strong> <code>{largest_backup.name}</code> ({largest_backup.lines:,} lines)</p>
-          """
-
-    optimal_sequences: list[str] = []
-    for segment in result.optimal_path or []:
-        optimal_sequences.append(
-            f"{{start: {segment.start_ts}, end: {segment.end_ts}, count: 0, "
-            f"sourceName: '{segment.file.name}', sourcePath: '{segment.file.path.resolve()}'}}"
-        )
-
-    optimal_sequence_javascript = "[" + ", ".join(optimal_sequences) + "]"
-
-    if result.optimal_path:
-        optimal_lines = sum(segment.file.lines for segment in result.optimal_path)
-        optimal_entry = (
-            f'{{ name: "✨ Best Recovery Path", path: "", '
-            f"start: {result.optimal_path[0].start_ts}, end: {result.optimal_path[-1].end_ts}, "
-            f'lines: {optimal_lines}, type: "optimal", sequences: {optimal_sequence_javascript} }}'
-        )
-        data_javascript = optimal_entry + ",\n            " + data_javascript
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -219,23 +160,11 @@ def generate_html(result: AnalysisResult) -> str:
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             border: 2px solid #8b9aff;
         }}
-        .cat-timestamped {{
-            background: linear-gradient(135deg, #ff9a56 0%, #ffcd39 100%);
-            border: 2px solid #ffa726;
-        }}
-        .cat-clean {{
-            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
-        }}
         .cat-snapshot {{
             background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
         }}
         .cat-other {{
             background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
-        }}
-        .cat-optimal {{
-            background: linear-gradient(135deg, #ff0844 0%, #ffb199 100%);
-            border: 2px solid #ff4b4b;
-            box-shadow: 0 0 10px rgba(255, 75, 75, 0.3);
         }}
         .date-axis {{
             display: flex;
@@ -319,9 +248,7 @@ def generate_html(result: AnalysisResult) -> str:
 
         <div class="summary">
             <h2>Analysis Results</h2>
-            {cleanliness_note_html}
             {gap_html}
-            {recovery_html}
             <div class="stats">
                 <p>Total files analyzed: {len(result.files)}</p>
             </div>
@@ -336,16 +263,8 @@ def generate_html(result: AnalysisResult) -> str:
                     <span>Main .zsh_history</span>
                 </div>
                 <div class="legend-item">
-                    <div class="legend-color cat-timestamped"></div>
-                    <span>.zsh_history_backups/</span>
-                </div>
-                <div class="legend-item">
-                    <div class="legend-color cat-clean"></div>
-                    <span>Explicit .zsh_hist.clean.*</span>
-                </div>
-                <div class="legend-item">
                     <div class="legend-color cat-snapshot"></div>
-                    <span>.zsh_history.* snapshots</span>
+                    <span>.zsh_history.* files</span>
                 </div>
             </div>
         </div>
@@ -427,8 +346,6 @@ def generate_html(result: AnalysisResult) -> str:
         const sortedData = [...data].sort((a, b) => {{
             if (a.type === 'main') return -1;
             if (b.type === 'main') return 1;
-            if (a.type === 'timestamped' && b.type !== 'timestamped') return -1;
-            if (b.type === 'timestamped' && a.type !== 'timestamped') return 1;
             return a.start - b.start;
         }});
 
@@ -460,7 +377,7 @@ def generate_html(result: AnalysisResult) -> str:
                 bar.dataset.start = seq.start;
                 bar.dataset.end = seq.end;
 
-                const itemPath = seq.sourcePath || item.path;
+                const itemPath = item.path;
                 bar.dataset.path = itemPath;
 
                 const durationDays = Math.max(1, Math.round((seq.end - seq.start) / 86400));
@@ -491,8 +408,8 @@ def generate_html(result: AnalysisResult) -> str:
                     }});
 
                     const rect = bar.getBoundingClientRect();
-                    const title = seq.sourceName ? `Expected Source: ${{seq.sourceName}}` : item.name;
-                    const subtitle = seq.sourcePath || item.path;
+                    const title = item.name;
+                    const subtitle = item.path;
 
                     tooltip.innerHTML = `
                         <strong>${{title}}</strong><br>
@@ -526,25 +443,6 @@ def generate_html(result: AnalysisResult) -> str:
             row.appendChild(label);
             row.appendChild(track);
             timeline.appendChild(row);
-        }});
-
-        document.querySelectorAll('.recovery-source').forEach(element => {{
-            element.addEventListener('mouseenter', () => {{
-                const path = element.dataset.path;
-                if (!path) return;
-
-                document.querySelectorAll('.timeline-bar').forEach(bar => {{
-                    if (bar.dataset.path === path) {{
-                        bar.classList.add('related');
-                    }}
-                }});
-            }});
-
-            element.addEventListener('mouseleave', () => {{
-                 document.querySelectorAll('.timeline-bar.related').forEach(bar => {{
-                    bar.classList.remove('related');
-                }});
-            }});
         }});
 
         Object.keys(points).forEach(timestamp => {{
